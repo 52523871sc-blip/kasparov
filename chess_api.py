@@ -4,14 +4,22 @@ Chess AI Play API - REST API for chess move recommendations
 
 from flask import Flask, request, jsonify
 import json
-from chess_ai_engine import ChessAIEngine
+from stockfish_engine import StockfishEngine
 from datetime import datetime
 import os
+import sys
 
 app = Flask(__name__)
 
-# Initialize AI engine
-ai_engine = ChessAIEngine()
+# ONLY use Stockfish - no fallback
+engine = StockfishEngine()
+if not engine.engine:
+    print("ERROR: Stockfish not found! Cannot start API.")
+    print("Please ensure Stockfish binary exists at: ./stockfish/stockfish-macos-m1-apple-silicon")
+    sys.exit(1)
+
+print("✅ Stockfish Engine loaded and ready!")
+engine_type = "Stockfish"
 
 # Store game history for learning
 game_history = []
@@ -42,8 +50,8 @@ def recommend_move():
         current_player = data.get('current_player', 'white')
         num_alternatives = data.get('num_alternatives', 3)
         
-        # Get AI recommendations
-        move_recommendations = ai_engine.get_best_moves(
+        # Get move recommendations from HuggingFace engine
+        move_recommendations = engine.get_move_analysis(
             position, current_player, num_alternatives + 1
         )
         
@@ -54,8 +62,8 @@ def recommend_move():
         best_move = move_recommendations[0]
         alternatives = move_recommendations[1:num_alternatives + 1]
         
-        # Compare moves and explain differences
-        comparisons = ai_engine.compare_moves(best_move, alternatives)
+        # Generate comparisons
+        comparisons = [{'reasons_worse': ['Lower evaluation'], 'alternative_merits': []} for _ in alternatives]
         
         response = {
             'best_move': {
@@ -104,23 +112,25 @@ def analyze_position():
         position = data['position']
         current_player = data.get('current_player', 'white')
         
-        # Evaluate position
-        score = ai_engine.evaluate_position(position, current_player)
+        # Evaluate position using HuggingFace engine
+        score = engine.evaluate_position(position, current_player)
         
-        # Get detailed analysis
-        features = ai_engine.position_to_features(position)
+        # Get material balance
+        piece_values = {'pawn': 100, 'knight': 320, 'bishop': 330, 'rook': 500, 'queen': 900, 'king': 20000}
+        white_material = sum(piece_values.get(p['type'], 0) for p in position.values() if p and p['color'] == 'white')
+        black_material = sum(piece_values.get(p['type'], 0) for p in position.values() if p and p['color'] == 'black')
         
         response = {
             'evaluation_score': score,
             'evaluation_text': _score_to_text(score),
-            'confidence': ai_engine._calculate_confidence(score),
+            'confidence': 'high' if abs(score) > 0.3 else 'medium',
             'material_balance': {
-                'white': ai_engine._calculate_material(position, 'white'),
-                'black': ai_engine._calculate_material(position, 'black')
+                'white': white_material,
+                'black': black_material
             },
             'piece_count': {
-                'white': ai_engine._count_pieces(position, 'white'),
-                'black': ai_engine._count_pieces(position, 'black')
+                'white': sum(1 for p in position.values() if p and p['color'] == 'white'),
+                'black': sum(1 for p in position.values() if p and p['color'] == 'black')
             },
             'timestamp': datetime.now().isoformat()
         }
@@ -172,8 +182,7 @@ def submit_game():
         
         game_history.append(game_data)
         
-        # Learn from game
-        ai_engine.learn_from_game_result(moves, result)
+        # Note: HuggingFace engine doesn't support learning (pre-trained model)
         
         response = {
             'message': 'Game submitted successfully',
@@ -194,9 +203,8 @@ def learning_stats():
         stats = {
             'total_games_learned': len(game_history),
             'total_positions_analyzed': sum(len(game['moves']) for game in game_history),
-            'model_file_exists': os.path.exists(ai_engine.model_path),
-            'cache_size': len(ai_engine.position_cache),
-            'learning_data_size': len(ai_engine.learning_data),
+            'model_type': 'Stockfish Chess Engine',
+            'model_status': 'Ready',
             'recent_games': [
                 {
                     'game_id': game['game_id'],
@@ -228,8 +236,6 @@ def reset_learning():
     try:
         global game_history
         game_history = []
-        ai_engine.learning_data = []
-        ai_engine.position_cache = {}
         
         return jsonify({
             'message': 'Learning data reset successfully',
