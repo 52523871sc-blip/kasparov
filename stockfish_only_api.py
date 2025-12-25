@@ -297,6 +297,10 @@ def analyze_position():
                     cp_score = score.score()
                 
                 piece = board.piece_at(move.from_square)
+                
+                # Generate detailed reasoning for score difference
+                score_reasoning = _generate_score_reasoning(board, move, cp_score, user_cp_score, i == 0)
+                
                 engine_alternatives.append({
                     'move': {
                         'from': chess.square_name(move.from_square),
@@ -304,7 +308,8 @@ def analyze_position():
                         'piece': piece.symbol().lower() if piece else 'p'
                     },
                     'score': cp_score / 100.0,
-                    'rank': i + 1
+                    'rank': i + 1,
+                    'score_reasoning': score_reasoning
                 })
         
         response = {
@@ -442,6 +447,95 @@ def _generate_move_improvement_suggestions(user_analysis):
     suggestions.append("Practice endgame positions to understand piece values better.")
     
     return suggestions
+
+def _generate_score_reasoning(board, move, move_score, user_score, is_best_move):
+    """Generate detailed reasoning for why this move has its score"""
+    reasoning = []
+    
+    # Score comparison with user move
+    score_diff = move_score - user_score
+    
+    if is_best_move:
+        reasoning.append("This is the engine's top choice because:")
+    else:
+        if score_diff > 0:
+            reasoning.append(f"This move scores {abs(score_diff)/100:.2f} points higher than your move because:")
+        else:
+            reasoning.append(f"This move scores {abs(score_diff)/100:.2f} points lower than your move because:")
+    
+    # Analyze move characteristics for reasoning
+    board_copy = board.copy()
+    original_material = _calculate_material_value(board)
+    
+    # Check for captures
+    captured_piece = board.piece_at(move.to_square)
+    if captured_piece:
+        piece_values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+        capture_value = piece_values.get(captured_piece.piece_type, 0)
+        reasoning.append(f"• Captures {captured_piece.symbol().upper()} worth {capture_value} points")
+    
+    # Make the move to analyze consequences
+    board_copy.push(move)
+    new_material = _calculate_material_value(board_copy)
+    
+    # Check for checks
+    if board_copy.is_check():
+        reasoning.append("• Gives check, forcing opponent's response")
+    
+    # Check for checkmate
+    if board_copy.is_checkmate():
+        reasoning.append("• Delivers checkmate - game winning move")
+    
+    # Analyze piece activity
+    piece = board.piece_at(move.from_square)
+    if piece:
+        # Center control
+        if move.to_square in [chess.D4, chess.D5, chess.E4, chess.E5]:
+            reasoning.append("• Controls important central squares")
+        
+        # Piece development
+        if piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
+            from_rank = chess.square_rank(move.from_square)
+            back_rank = 0 if piece.color == chess.WHITE else 7
+            if from_rank == back_rank:
+                reasoning.append("• Develops piece from back rank")
+        
+        # King safety (castling)
+        if piece.piece_type == chess.KING and abs(chess.square_file(move.to_square) - chess.square_file(move.from_square)) == 2:
+            reasoning.append("• Improves king safety through castling")
+    
+    # Analyze threats created
+    attacking_squares = list(board_copy.attacks(move.to_square))
+    valuable_targets = []
+    for target_square in attacking_squares:
+        target_piece = board_copy.piece_at(target_square)
+        if target_piece and target_piece.color != piece.color:
+            if target_piece.piece_type in [chess.QUEEN, chess.ROOK]:
+                valuable_targets.append(target_piece.symbol().upper())
+    
+    if valuable_targets:
+        reasoning.append(f"• Creates threats against {', '.join(valuable_targets)}")
+    
+    # Positional factors
+    if abs(move_score) < 50:  # Small score differences are often positional
+        reasoning.append("• Provides better piece coordination and mobility")
+    
+    # If no specific reasons found, give general explanation
+    if len(reasoning) == 1:  # Only has the comparison line
+        if move_score > user_score:
+            reasoning.append("• Better long-term position and piece activity")
+        else:
+            reasoning.append("• Less optimal piece placement or missed opportunities")
+    
+    return reasoning
+
+def _calculate_material_value(board):
+    """Calculate total material value on board"""
+    piece_values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+    total = 0
+    for piece in board.piece_map().values():
+        total += piece_values.get(piece.piece_type, 0)
+    return total
 
 @app.route('/api/health', methods=['GET'])
 def health_check():

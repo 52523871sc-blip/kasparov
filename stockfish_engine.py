@@ -149,6 +149,36 @@ class StockfishEngine:
         
         return []
     
+    def evaluate_move(self, position, move, current_player='white'):
+        """Evaluate a specific move"""
+        if not self.engine:
+            return 0.0
+        
+        try:
+            board = self.position_to_board(position)
+            board.turn = current_player == 'white'
+            
+            # Make the move
+            from_square = chess.parse_square(move['from'])
+            to_square = chess.parse_square(move['to'])
+            chess_move = chess.Move(from_square, to_square)
+            
+            if chess_move in board.legal_moves:
+                board.push(chess_move)
+                info = self.engine.analyse(board, chess.engine.Limit(time=0.1))
+                score = info["score"].relative
+                
+                if score.is_mate():
+                    return 1.0 if score.mate() > 0 else -1.0
+                else:
+                    cp_score = score.score() / 100.0
+                    return max(-1.0, min(1.0, cp_score / 10.0))
+            
+        except Exception as e:
+            print(f"Stockfish move evaluation error: {e}")
+        
+        return 0.0
+    
     def quit(self):
         """Close Stockfish engine"""
         if self.engine:

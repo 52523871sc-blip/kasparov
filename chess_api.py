@@ -9,6 +9,10 @@ from stockfish_engine import StockfishEngine
 from datetime import datetime
 import os
 import sys
+import torch
+import chess
+import numpy as np
+from chess_ml_model import ChessNet, ChessTrainer, ChessPositionEncoder
 
 app = Flask(__name__)
 CORS(app, resources={
@@ -28,6 +32,29 @@ if not engine.engine:
 
 print("✅ Stockfish Engine loaded and ready!")
 engine_type = "Stockfish"
+
+# Load ML model
+ml_model = None
+ml_trainer = None
+try:
+    ml_model = ChessNet()
+    if os.path.exists('chess_ml_model.pth'):
+        ml_model.load_state_dict(torch.load('chess_ml_model.pth', map_location='cpu'))
+        ml_trainer = ChessTrainer(ml_model, device='cpu')
+        print("✅ ML Chess Model loaded and ready!")
+    elif os.path.exists('chess_ml_model_backup.pth'):
+        print("⚠️ Using backup ML model...")
+        ml_model.load_state_dict(torch.load('chess_ml_model_backup.pth', map_location='cpu'))
+        ml_trainer = ChessTrainer(ml_model, device='cpu')
+        print("✅ ML Chess Model loaded from backup!")
+    else:
+        print("⚠️ ML model not found. Training new model...")
+        from chess_ml_model import train_chess_model
+        ml_model, ml_trainer = train_chess_model()
+except Exception as e:
+    print(f"❌ Failed to load ML model: {e}")
+    ml_model = None
+    ml_trainer = None
 
 # Store game history for learning
 game_history = []
@@ -49,7 +76,9 @@ def recommend_move():
     }
     """
     try:
+        print("🔥 API CALL RECEIVED - recommend_move")
         data = request.get_json()
+        print(f"📥 Request data: {data}")
         
         if not data or 'position' not in data:
             return jsonify({'error': 'Missing position data'}), 400
@@ -79,7 +108,7 @@ def recommend_move():
                 'score': best_move['score'],
                 'confidence': best_move['analysis']['confidence'],
                 'analysis': best_move['analysis'],
-                'reasoning': _generate_move_reasoning(best_move['analysis'])
+                'reasoning': _generate_move_reasoning(best_move['analysis'], best_move['score'])
             },
             'alternatives': [
                 {
@@ -98,6 +127,9 @@ def recommend_move():
         return jsonify(response)
         
     except Exception as e:
+        print(f"💥 ERROR in recommend_move: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/analyze-position', methods=['POST'])
@@ -251,6 +283,214 @@ def health_check():
         'ai_engine': 'loaded',
         'timestamp': datetime.now().isoformat()
     })
+
+@app.route('/api/recommend-move-ml', methods=['POST'])
+def recommend_move_ml():
+    """
+    Get AI move recommendation using local ML model
+    
+    Expected JSON input:
+    {
+        "position": {
+            "a1": {"type": "rook", "color": "white"},
+            "e1": {"type": "king", "color": "white"},
+            ...
+        },
+        "current_player": "white",
+        "num_alternatives": 3
+    }
+    """
+    try:
+        if ml_trainer is None:
+            return jsonify({'error': 'ML model not available'}), 500
+        
+        data = request.get_json()
+        
+        if not data or 'position' not in data:
+            return jsonify({'error': 'Missing position data'}), 400
+        
+        position = data['position']
+        current_player = data.get('current_player', 'white')
+        num_alternatives = data.get('num_alternatives', 3)
+        
+        # Convert API position to chess.Board
+        board = _api_position_to_board(position)
+        board.turn = current_player == 'white'
+        
+        # Get ML model predictions
+        move_probs, position_value = ml_trainer.predict_move(board)
+        
+        if not move_probs:
+            return jsonify({'error': 'No legal moves found'}), 400
+        
+        # Format best move
+        best_move_chess = move_probs[0][0]
+        best_move_prob = move_probs[0][1]
+        
+        best_move = {
+            'move': {
+                'from': chess.square_name(best_move_chess.from_square),
+                'to': chess.square_name(best_move_chess.to_square),
+                'piece': _get_piece_name(board.piece_at(best_move_chess.from_square)),
+                'color': current_player
+            },
+            'score': position_value,
+            'confidence': 'high' if best_move_prob > 0.3 else 'medium' if best_move_prob > 0.1 else 'low',
+            'analysis': {
+                'confidence': 'high' if best_move_prob > 0.3 else 'medium',
+                'tactical_elements': _analyze_ml_move_tactics(board, best_move_chess),
+                'strategic_themes': _analyze_ml_move_strategy(board, best_move_chess),
+                'probability': best_move_prob
+            },
+            'reasoning': _generate_ml_move_reasoning(board, best_move_chess, position_value)
+        }
+        
+        # Format alternatives
+        alternatives = []
+        for i in range(1, min(len(move_probs), num_alternatives + 1)):
+            alt_move_chess = move_probs[i][0]
+            alt_prob = move_probs[i][1]
+            
+            alt_move = {
+                'move': {
+                    'from': chess.square_name(alt_move_chess.from_square),
+                    'to': chess.square_name(alt_move_chess.to_square),
+                    'piece': _get_piece_name(board.piece_at(alt_move_chess.from_square)),
+                    'color': current_player
+                },
+                'score': position_value * (alt_prob / best_move_prob),  # Adjust score by probability ratio
+                'analysis': {
+                    'confidence': 'medium' if alt_prob > 0.1 else 'low',
+                    'tactical_elements': _analyze_ml_move_tactics(board, alt_move_chess),
+                    'strategic_themes': _analyze_ml_move_strategy(board, alt_move_chess),
+                    'probability': alt_prob
+                },
+                'why_worse': [f'Lower probability ({alt_prob:.3f} vs {best_move_prob:.3f})'],
+                'merits': ['Alternative strategic approach']
+            }
+            alternatives.append(alt_move)
+        
+        response = {
+            'best_move': best_move,
+            'alternatives': alternatives,
+            'position_evaluation': position_value,
+            'engine_info': {
+                'name': 'Custom Chess ML Model',
+                'type': 'Neural Network',
+                'confidence': best_move['confidence']
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def _api_position_to_board(position):
+    """Convert API position format to chess.Board"""
+    board = chess.Board()
+    board.clear()
+    
+    piece_map = {
+        'pawn': chess.PAWN, 'knight': chess.KNIGHT, 'bishop': chess.BISHOP,
+        'rook': chess.ROOK, 'queen': chess.QUEEN, 'king': chess.KING
+    }
+    
+    for square_name, piece_info in position.items():
+        try:
+            square = chess.parse_square(square_name)
+            piece_type = piece_map[piece_info['type']]
+            color = piece_info['color'] == 'white'
+            piece = chess.Piece(piece_type, color)
+            board.set_piece_at(square, piece)
+        except:
+            continue
+    
+    return board
+
+def _get_piece_name(piece):
+    """Get piece name from chess.Piece"""
+    if piece is None:
+        return 'unknown'
+    
+    piece_names = {
+        chess.PAWN: 'pawn', chess.KNIGHT: 'knight', chess.BISHOP: 'bishop',
+        chess.ROOK: 'rook', chess.QUEEN: 'queen', chess.KING: 'king'
+    }
+    
+    return piece_names.get(piece.piece_type, 'unknown')
+
+def _analyze_ml_move_tactics(board, move):
+    """Analyze tactical elements of ML predicted move"""
+    tactics = []
+    
+    # Check for capture
+    if board.piece_at(move.to_square):
+        tactics.append('capture')
+    
+    # Check for check
+    board_copy = board.copy()
+    board_copy.push(move)
+    if board_copy.is_check():
+        tactics.append('check')
+    
+    # Check for castling
+    piece = board.piece_at(move.from_square)
+    if piece and piece.piece_type == chess.KING:
+        if abs(move.to_square - move.from_square) == 2:
+            tactics.append('castling')
+    
+    return tactics
+
+def _analyze_ml_move_strategy(board, move):
+    """Analyze strategic themes of ML predicted move"""
+    themes = []
+    
+    piece = board.piece_at(move.from_square)
+    if piece:
+        # Development
+        if piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
+            from_rank = chess.square_rank(move.from_square)
+            back_rank = 0 if piece.color == chess.WHITE else 7
+            if from_rank == back_rank:
+                themes.append('development')
+        
+        # Center control
+        if move.to_square in [chess.D4, chess.D5, chess.E4, chess.E5]:
+            themes.append('center_control')
+        
+        # ML learned patterns
+        themes.append('ml_pattern')
+    
+    return themes
+
+def _generate_ml_move_reasoning(board, move, position_value):
+    """Generate reasoning for ML predicted move"""
+    reasoning = []
+    
+    # Position evaluation reasoning
+    if position_value > 0.3:
+        reasoning.append("ML model evaluates this as a winning position")
+    elif position_value > 0:
+        reasoning.append("ML model sees a slight advantage")
+    elif position_value > -0.3:
+        reasoning.append("ML model evaluates position as balanced")
+    else:
+        reasoning.append("ML model suggests defensive play")
+    
+    # Move-specific reasoning
+    piece = board.piece_at(move.from_square)
+    if piece:
+        if board.piece_at(move.to_square):
+            reasoning.append("Captures opponent piece")
+        
+        if piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
+            reasoning.append("Develops piece toward center")
+        
+        reasoning.append("Move follows learned chess patterns")
+    
+    return reasoning
 
 @app.route('/api/reset-learning', methods=['POST'])
 def reset_learning():
@@ -574,12 +814,11 @@ def _compare_strategies(user_move, engine_move):
     
     return f"Your approach: {user_strategy}. Engine approach: {engine_strategy}."
 
-def _generate_move_reasoning(analysis):
+def _generate_move_reasoning(analysis, score):
     """Generate human-readable reasoning for move"""
     reasoning = []
     
     # Score-based reasoning
-    score = analysis['score']
     if score > 0.5:
         reasoning.append("This move leads to a winning advantage")
     elif score > 0.2:
@@ -609,18 +848,18 @@ def _generate_move_reasoning(analysis):
     if 'center_control' in themes:
         reasoning.append("Controls important central squares")
     
-    return reasoningment")
     if 'centralization' in themes:
         reasoning.append("Centralizes pieces effectively")
     if 'coordination' in themes:
         reasoning.append("Enhances piece coordination")
     
     # Positional reasoning
-    pos_factors = analysis['positional_factors']
-    if pos_factors.get('center_control', 0) > 0.6:
-        reasoning.append("Strengthens center control")
-    if pos_factors.get('king_safety', 0) > 0.6:
-        reasoning.append("Improves king safety")
+    pos_factors = analysis.get('positional_factors', {})
+    if isinstance(pos_factors, dict):
+        if pos_factors.get('center_control', 0) > 0.6:
+            reasoning.append("Strengthens center control")
+        if pos_factors.get('king_safety', 0) > 0.6:
+            reasoning.append("Improves king safety")
     
     return reasoning
 
@@ -641,11 +880,21 @@ def _score_to_text(score):
     else:
         return "Winning advantage for opponent"
 
+def _describe_move(move):
+    """Generate human-readable description of a move"""
+    piece_names = {
+        'pawn': 'Pawn', 'knight': 'Knight', 'bishop': 'Bishop',
+        'rook': 'Rook', 'queen': 'Queen', 'king': 'King'
+    }
+    piece_name = piece_names.get(move.get('piece', '').lower(), 'Piece')
+    return f"{piece_name} from {move.get('from', '?')} to {move.get('to', '?')}"
+
 if __name__ == '__main__':
     print("Starting Chess AI Play API...")
     print("AI Engine loaded and ready")
     print("Available endpoints:")
-    print("  POST /api/recommend-move - Get move recommendations")
+    print("  POST /api/recommend-move - Get move recommendations (Stockfish)")
+    print("  POST /api/recommend-move-ml - Get move recommendations (ML Model)")
     print("  POST /api/analyze-position - Analyze position")
     print("  POST /api/submit-game - Submit game for learning")
     print("  GET  /api/learning-stats - Get learning statistics")
